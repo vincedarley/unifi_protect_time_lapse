@@ -139,13 +139,14 @@ class TimelapseService:
         date_str = target_date.strftime("%Y-%m-%d")
         logging.info(f"Creating time-lapses for {date_str} with {len(cameras)} cameras")
 
-        # Create tasks for each camera and interval combination
+        # Create tasks for each camera and details combination
         tasks = []
         for camera in cameras:
             for interval in config.FETCH_INTERVALS:
+                details = f"{interval}s"
                 task = asyncio.create_task(
-                    self._create_timelapse_for_camera_interval(
-                        camera.safe_name, interval, target_date
+                    self._create_timelapse_for_camera_details(
+                        camera.safe_name, details, target_date
                     )
                 )
                 tasks.append(task)
@@ -163,10 +164,10 @@ class TimelapseService:
                 f"Time-lapse creation summary: {successful} successful, {failed} failed, {skipped} skipped"
             )
 
-    async def _create_timelapse_for_camera_interval(
-        self, camera_name: str, interval: int, target_date: datetime
+    async def _create_timelapse_for_camera_details(
+        self, camera_name: str, details: str, target_date: datetime
     ) -> bool | None:
-        """Create a time-lapse video for a specific camera and interval."""
+        """Create a time-lapse video for a specific camera and details."""
 
         async with self.creation_semaphore:
             year = target_date.strftime("%Y")
@@ -177,19 +178,19 @@ class TimelapseService:
             images_path = (
                 config.IMAGE_OUTPUT_PATH
                 / camera_name
-                / f"{interval}s"
+                / details
                 / year
                 / month
                 / day
             )
             videos_path = (
-                config.VIDEO_OUTPUT_PATH / year / month / camera_name / f"{interval}s"
+                config.VIDEO_OUTPUT_PATH / year / month / camera_name / details
             )
 
             # Check if images directory exists and has images
             if not images_path.exists():
                 logging.debug(
-                    f"No images directory for {camera_name} {interval}s on {target_date.strftime('%Y-%m-%d')}"
+                    f"No images directory for {camera_name} {details} on {target_date.strftime('%Y-%m-%d')}"
                 )
                 return None
 
@@ -197,48 +198,48 @@ class TimelapseService:
             image_files = list(images_path.glob(f"{camera_name}_*.jpg"))
             if not image_files:
                 logging.debug(
-                    f"No images found for {camera_name} {interval}s on {target_date.strftime('%Y-%m-%d')}"
+                    f"No images found for {camera_name} {details} on {target_date.strftime('%Y-%m-%d')}"
                 )
                 return None
 
             logging.info(
-                f"Creating time-lapse for {camera_name} {interval}s: {len(image_files)} images"
+                f"Creating time-lapse for {camera_name} {details}: {len(image_files)} images"
             )
 
             # Create output directory
             videos_path.mkdir(parents=True, exist_ok=True)
 
             # Define output file
-            output_filename = f"{camera_name}_{year}{month}{day}_{interval}s.mp4"
+            output_filename = f"{camera_name}_{year}{month}{day}_{details}.mp4"
             output_path = videos_path / output_filename
 
             # Check if file already exists and we shouldn't overwrite
             if output_path.exists() and not config.FFMPEG_OVERWRITE_FILE:
                 logging.info(
-                    f"Time-lapse already exists for {camera_name} {interval}s, skipping"
+                    f"Time-lapse already exists for {camera_name} {details}, skipping"
                 )
                 return None
 
             # Create time-lapse video
             success = await self._create_video(
-                images_path, output_path, camera_name, interval
+                images_path, output_path, camera_name, details
             )
 
             if success and config.FFMPEG_DELETE_IMAGES_AFTER_SUCCESS:
                 try:
                     shutil.rmtree(images_path)
                     logging.info(
-                        f"Deleted images for {camera_name} {interval}s after successful video creation"
+                        f"Deleted images for {camera_name} {details} after successful video creation"
                     )
                 except Exception as e:
                     logging.error(
-                        f"Failed to delete images for {camera_name} {interval}s: {e}"
+                        f"Failed to delete images for {camera_name} {details}: {e}"
                     )
 
             return success
 
     async def _create_video(
-        self, images_path: Path, output_path: Path, camera_name: str, interval: int
+        self, images_path: Path, output_path: Path, camera_name: str, details: str
     ) -> bool:
         """Create a video using FFmpeg."""
 
@@ -294,24 +295,24 @@ class TimelapseService:
                     formatted_size = self._format_file_size(file_size)
 
                     logging.info(
-                        f"✓ Created time-lapse for {camera_name} {interval}s in "
+                        f"✓ Created time-lapse for {camera_name} {details} in "
                         f"{self._format_duration(duration_seconds)}, size: {formatted_size}"
                     )
                     return True
                 else:
                     logging.error(
-                        f"✗ Output file not created or empty for {camera_name} {interval}s"
+                        f"✗ Output file not created or empty for {camera_name} {details}"
                     )
                     return False
             else:
                 error_msg = stderr.decode("utf-8") if stderr else "Unknown error"
                 logging.error(
-                    f"✗ FFmpeg failed for {camera_name} {interval}s: {error_msg[:200]}"
+                    f"✗ FFmpeg failed for {camera_name} {details}: {error_msg[:200]}"
                 )
                 return False
 
         except Exception as e:
-            logging.error(f"✗ Error creating video for {camera_name} {interval}s: {e}")
+            logging.error(f"✗ Error creating video for {camera_name} {details}: {e}")
             return False
 
     def _format_file_size(self, size_bytes: int) -> str:

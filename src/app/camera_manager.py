@@ -2,6 +2,8 @@
 
 import httpx  # type: ignore
 import asyncio
+import aiohttp # type: ignore
+import requests
 import logging
 import hashlib
 import math
@@ -477,46 +479,123 @@ class CameraManager:
         concurrent_limit = config.calculate_effective_concurrent_limit()
         semaphore = asyncio.Semaphore(concurrent_limit)
 
-        async def capture_with_semaphore(camera: Camera) -> tuple[str, bool]:
-            async with semaphore:
-                # Build output path
-                date_obj = datetime.fromtimestamp(timestamp)
-                year = date_obj.strftime("%Y")
-                month = date_obj.strftime("%m")
-                day = date_obj.strftime("%d")
+        tasks = []
 
+        async def capture_with_semaphore(
+            camera: Camera,
+            interval: int,
+            timestamp: int,
+            preset_name: str | None = None,
+            preset_number: str | None = None,
+        ) -> tuple[str, str | None, bool]:
+            async with semaphore:
+                # Move camera to preset if defined
+                if preset_number is not None:
+                    url = f"{config.UNIFI_PROTECT_BASE_URL}/cameras/{camera.id}/ptz/goto/{preset_number}"
+                    headers = {
+                        "X-API-Key": config.UNIFI_PROTECT_API_KEY,
+                        "Accept": "application/json",
+                        "User-Agent": "UniFi-Protect-Time-Lapse/2.0",
+                    }
+                    try:
+                        # Use aiohttp for non-blocking PTZ requests
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(
+                                url,
+                                headers=headers,
+                                ssl=config.UNIFI_PROTECT_VERIFY_SSL,
+                                timeout=int(config.UNIFI_PROTECT_REQUEST_TIMEOUT),
+                            ) as resp:
+                                if resp.status in (200, 204):
+                                    logging.info(
+                                        f"[PTZ] Moved {camera.name} to preset {preset_name} ({preset_number})"
+                                    )
+                                else:
+                                    logging.warning(
+                                        f"[PTZ] PTZ move returned {resp.status} for {camera.name}"
+                                    )
+
+                        # Wait for camera to reach the preset
+                        await asyncio.sleep(config.CAMERA_PTZ_PRESET_DELAY)  # e.g., 2 seconds
+                    except Exception as e:
+                        logging.warning(f"[PTZ] Error moving {camera.name} to preset {preset_name}: {e}")
+
+                # Build output directory and file path
+                date_obj = datetime.fromtimestamp(timestamp)
+                year, month, day = date_obj.strftime("%Y"), date_obj.strftime("%m"), date_obj.strftime("%d")
+
+                camera_dir_name = f"{camera.safe_name}-{preset_name}" if preset_name else f"{camera.safe_name}"
                 output_dir = (
                     config.IMAGE_OUTPUT_PATH
-                    / camera.safe_name
+                    / camera_dir_name
                     / f"{interval}s"
                     / year
                     / month
                     / day
                 )
+                output_dir.mkdir(parents=True, exist_ok=True)
                 output_path = output_dir / f"{camera.safe_name}_{timestamp}.jpg"
 
-                success = await self.capture_snapshot_with_retry(
-                    camera, str(output_path), interval
-                )
-                return camera.name, success
+                # Capture snapshot
+                try:
+                    success = await self.capture_snapshot_with_retry(camera, str(output_path), interval)
+                    print(f"[CAPTURE] {camera.name} preset {preset_name}: {'Success' if success else 'Failed'}")
+                except Exception as e:
+                    print(f"[CAPTURE] {camera.name} preset {preset_name} failed: {e}")
+                    success = False
 
-        # Execute all captures concurrently (only connected cameras)
-        tasks = [capture_with_semaphore(camera) for camera in connected_cameras]
+                return camera.name, preset_name, success
+
+        # Execute captures: run different cameras in parallel, but run presets for the same camera serially
+        async def run_presets_serially(camera: Camera):
+            """Run all presets for a single camera one after another."""
+            camera_results = []
+            presets = config.CAMERA_PRESETS.get(camera.name, {"Default": None})
+            for preset_name, preset_number in presets.items():
+                try:
+                    result = await capture_with_semaphore(camera, interval, timestamp, preset_name, preset_number)
+                    camera_results.append(result)
+                except Exception as e:
+                    logging.error(f"Error capturing preset {preset_name} for {camera.name}: {e}")
+            return camera_results
+
+        # Create one task per camera (presets inside will run serially)
+        for camera in connected_cameras:
+            tasks.append(asyncio.create_task(run_presets_serially(camera)))
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Process results
+        # Process results (results is a list of lists-of-tuples or exceptions)
         capture_results = {}
-        for result in results:
-            if isinstance(result, tuple):
-                camera_name, success = result
-                capture_results[camera_name] = success
-            else:
-                logging.error(f"Unexpected error in camera capture: {result}")
+        for item in results:
+            if isinstance(item, Exception):
+                logging.error(f"Unexpected error in camera capture: {item}")
+                continue
 
-        # Log summary
-        successful = sum(1 for success in capture_results.values() if success)
-        total = len(capture_results)
-        logging.info(f"[{interval}s] Captured {successful}/{total} connected cameras")
+            # item should be a list of tuples (camera_name, preset_name, success)
+            if isinstance(item, list):
+                for sub in item:
+                    if isinstance(sub, tuple):
+                        camera_name, preset_name, success = sub
+                        if camera_name not in capture_results:
+                            capture_results[camera_name] = {}
+                        capture_results[camera_name][preset_name] = success
+                    else:
+                        logging.error(f"Unexpected capture result item: {sub}")
+            else:
+                logging.error(f"Unexpected capture result type: {type(item)}")
+
+        # Log summary per camera
+        total_presets = 0
+        successful_presets = 0
+        for camera_name, presets in capture_results.items():
+            for preset_name, success in presets.items():
+                total_presets += 1
+                if success:
+                    successful_presets += 1
+                logging.info(f"[{interval}s] {camera_name} preset {preset_name}: {'Success' if success else 'Failed'}")
+
+        logging.info(f"[{interval}s] Captured {successful_presets}/{total_presets} presets across all connected cameras")
 
         return capture_results
 
@@ -699,3 +778,32 @@ class CameraManager:
         )
 
         return all_results
+
+    async def set_ptz(self, camera: Camera, ptz: dict) -> bool:
+        """Send PTZ command to UniFi Protect for the given camera."""
+        url = f"{config.UNIFI_PROTECT_BASE_URL}/api/cameras/{camera.id}/ptz"
+
+        headers = {
+            "Authorization": f"Bearer {config.UNIFI_PROTECT_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=ptz,
+                    ssl=(config.UNIFI_PROTECT_VERIFY_SSL),
+                    timeout=int(config.UNIFI_PROTECT_REQUEST_TIMEOUT),
+                ) as response:
+                    if response.status == 200:
+                        return True
+                    else:
+                        logging.warning(
+                            f"PTZ request failed for {camera.name}: {response.status}"
+                        )
+                        return False
+        except Exception as e:
+            logging.error(f"Error sending PTZ command for {camera.name}: {e}")
+            return False

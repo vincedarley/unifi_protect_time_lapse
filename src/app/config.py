@@ -97,6 +97,23 @@ except json.JSONDecodeError as e:
 # Sort intervals
 FETCH_INTERVALS = sorted(FETCH_INTERVALS)
 
+# Fetch (optional) specific presets (PTZ values) for each camera
+CAMERA_PRESETS_JSON = os.getenv("CAMERA_PRESETS", "")
+if CAMERA_PRESETS_JSON:
+    try:
+        CAMERA_PRESETS = json.loads(CAMERA_PRESETS_JSON)
+    except json.JSONDecodeError as e:
+        logging.error(f"Error parsing CAMERA_PRESETS: {e}. Using empty dict.")
+        CAMERA_PRESETS = {}
+else:
+    CAMERA_PRESETS = {}
+
+# Default 2 seconds for a camera to move to point at a specific location
+CAMERA_PTZ_PRESET_DELAY = float(os.getenv("CAMERA_PTZ_PRESET_DELAY", "2.0"))
+
+# Default for the camera to return to the home preset after captures
+CAMERA_PTZ_RETURN_TO_HOME = bool(os.getenv("CAMERA_PTZ_RETURN_TO_HOME", "True"))
+
 # =============================================================================
 # PATH CONFIGURATIONS
 # =============================================================================
