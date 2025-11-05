@@ -183,6 +183,16 @@ services:
 | `CAMERA_BLACKLIST` | JSON array of camera names to exclude (blacklist mode) | `[]` | `'["Private Cam"]'` |
 | `FETCH_INTERVALS` | JSON array of capture intervals in seconds | `[10, 60]` | `[30, 300, 900]` |
 
+This release adds support for multiple PTZ presets per camera and an optional return-to-home behavior. Use the `CAMERA_PRESETS` environment variable to provide a JSON mapping of camera display names to preset dictionaries. Each preset dictionary maps a logical preset name to a preset index (or `null` to just capture without moving). Example:
+
+```yaml
+CAMERA_PRESETS: '{"Front Door Cam": {"Default": null, "CloseUp": 1, "Wide": 2}, "Garage Cam": {"Default": null}}'
+CAMERA_PTZ_RETURN_TO_HOME: "true"  # Return camera to Home preset (-1) after all presets run
+CAMERA_PTZ_PRESET_DELAY: "2.0"     # Seconds to wait after moving to a preset
+```
+
+When presets are configured, captured images are stored under the camera directory suffixed with the preset name, for example: `images/Front_Door_Cam-CloseUp/60s/...`.
+
 ### Fetch Settings (Rate-Limit Aware)
 
 | Variable | Description | Default | Example |

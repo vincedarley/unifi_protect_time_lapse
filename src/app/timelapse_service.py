@@ -142,14 +142,19 @@ class TimelapseService:
         # Create tasks for each camera and details combination
         tasks = []
         for camera in cameras:
-            for interval in config.FETCH_INTERVALS:
-                details = f"{interval}s"
-                task = asyncio.create_task(
-                    self._create_timelapse_for_camera_details(
-                        camera.safe_name, details, target_date
+            # Support multiple presets per camera; CAMERA_PRESETS maps camera.name -> {preset_name: preset_number}
+            presets = config.CAMERA_PRESETS.get(camera.name, {"Default": None})
+            for preset_name in presets.keys():
+                for interval in config.FETCH_INTERVALS:
+                    details = f"{interval}s"
+                    # Directory name includes preset suffix when present
+                    camera_dir_name = f"{camera.safe_name}-{preset_name}" if preset_name else camera.safe_name
+                    task = asyncio.create_task(
+                        self._create_timelapse_for_camera_details(
+                            camera_dir_name, details, target_date
+                        )
                     )
-                )
-                tasks.append(task)
+                    tasks.append(task)
 
         # Execute all creation tasks
         if tasks:

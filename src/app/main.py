@@ -339,16 +339,26 @@ async def test_cameras():
                 results = await camera_manager.capture_all_cameras(timestamp, 60)
                 method = "concurrent"
 
-            # Report results
-            successful = sum(1 for success in results.values() if success)
-            total = len(results)
+            # Report results (support per-camera preset results)
+            successful = 0
+            total = 0
+            for v in results.values():
+                if isinstance(v, dict):
+                    total += len(v)
+                    successful += sum(1 for s in v.values() if s)
+                else:
+                    total += 1
+                    successful += 1 if v else 0
 
             logging.info(
-                f"Camera test completed ({method}): {successful}/{total} cameras accessible"
+                f"Camera test completed ({method}): {successful}/{total} captures successful"
             )
 
-            for camera_name, success in results.items():
-                status = "✓" if success else "✗"
+            for camera_name, v in results.items():
+                if isinstance(v, dict):
+                    status = "✓" if any(v.values()) else "✗"
+                else:
+                    status = "✓" if v else "✗"
                 logging.info(f"  {status} {camera_name}")
 
             # Report rate limit info

@@ -102,6 +102,9 @@ class CameraManager:
         self._locked_total_cameras = 0
         self._locked_use_distribution = False
         self._locked_optimal_offset = 0
+        # Track in-flight captures to avoid duplicate work (camera.id, preset_name, timestamp)
+        self._inflight_captures: set[tuple[str, str | None, int]] = set()
+        self._inflight_lock = asyncio.Lock()
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -489,36 +492,18 @@ class CameraManager:
             preset_number: str | None = None,
         ) -> tuple[str, str | None, bool]:
             async with semaphore:
+                # Prevent duplicate captures for same camera/preset/timestamp
+                key = (camera.id, preset_name, timestamp)
+                async with self._inflight_lock:
+                    if key in self._inflight_captures:
+                        logging.debug(f"Skipping duplicate capture for {camera.name} preset {preset_name} at {timestamp}")
+                        return camera.name, preset_name, False
+                    self._inflight_captures.add(key)
                 # Move camera to preset if defined
                 if preset_number is not None:
-                    url = f"{config.UNIFI_PROTECT_BASE_URL}/cameras/{camera.id}/ptz/goto/{preset_number}"
-                    headers = {
-                        "X-API-Key": config.UNIFI_PROTECT_API_KEY,
-                        "Accept": "application/json",
-                        "User-Agent": "UniFi-Protect-Time-Lapse/2.0",
-                    }
-                    try:
-                        # Use aiohttp for non-blocking PTZ requests
-                        async with aiohttp.ClientSession() as session:
-                            async with session.post(
-                                url,
-                                headers=headers,
-                                ssl=config.UNIFI_PROTECT_VERIFY_SSL,
-                                timeout=int(config.UNIFI_PROTECT_REQUEST_TIMEOUT),
-                            ) as resp:
-                                if resp.status in (200, 204):
-                                    logging.info(
-                                        f"[PTZ] Moved {camera.name} to preset {preset_name} ({preset_number})"
-                                    )
-                                else:
-                                    logging.warning(
-                                        f"[PTZ] PTZ move returned {resp.status} for {camera.name}"
-                                    )
-
-                        # Wait for camera to reach the preset
-                        await asyncio.sleep(config.CAMERA_PTZ_PRESET_DELAY)  # e.g., 2 seconds
-                    except Exception as e:
-                        logging.warning(f"[PTZ] Error moving {camera.name} to preset {preset_name}: {e}")
+                    moved = await self.goto_preset(camera, preset_number, preset_name)
+                    if not moved:
+                        logging.debug(f"[PTZ] Failed to move {camera.name} to preset {preset_name} ({preset_number})")
 
                 # Build output directory and file path
                 date_obj = datetime.fromtimestamp(timestamp)
@@ -539,10 +524,17 @@ class CameraManager:
                 # Capture snapshot
                 try:
                     success = await self.capture_snapshot_with_retry(camera, str(output_path), interval)
-                    print(f"[CAPTURE] {camera.name} preset {preset_name}: {'Success' if success else 'Failed'}")
+                    logging.info(f"[CAPTURE] {camera.name} preset {preset_name}: {'Success' if success else 'Failed'}")
                 except Exception as e:
-                    print(f"[CAPTURE] {camera.name} preset {preset_name} failed: {e}")
+                    logging.error(f"[CAPTURE] {camera.name} preset {preset_name} failed: {e}")
                     success = False
+
+                # Release inflight guard
+                async with self._inflight_lock:
+                    try:
+                        self._inflight_captures.remove(key)
+                    except KeyError:
+                        pass
 
                 return camera.name, preset_name, success
 
@@ -551,12 +543,32 @@ class CameraManager:
             """Run all presets for a single camera one after another."""
             camera_results = []
             presets = config.CAMERA_PRESETS.get(camera.name, {"Default": None})
+
+            # Determine if any preset will actually move the camera (non-None and not Home)
+            moved_presets = any(
+                (preset_number is not None and str(preset_number) != "-1")
+                for preset_number in presets.values()
+            )
+
             for preset_name, preset_number in presets.items():
                 try:
-                    result = await capture_with_semaphore(camera, interval, timestamp, preset_name, preset_number)
+                    result = await capture_with_semaphore(
+                        camera, interval, timestamp, preset_name, preset_number
+                    )
                     camera_results.append(result)
                 except Exception as e:
-                    logging.error(f"Error capturing preset {preset_name} for {camera.name}: {e}")
+                    logging.error(
+                        f"Error capturing preset {preset_name} for {camera.name}: {e}"
+                    )
+
+
+            # After all presets for this camera have been executed serially,
+            # optionally return the camera to the Home preset (-1)
+            if config.CAMERA_PTZ_RETURN_TO_HOME and moved_presets:
+                returned = await self.goto_preset(camera, -1, "Home")
+                if not returned:
+                    logging.warning(f"[PTZ] Failed to return {camera.name} to Home preset (-1)")
+
             return camera_results
 
         # Create one task per camera (presets inside will run serially)
@@ -601,7 +613,7 @@ class CameraManager:
 
     async def capture_cameras_distributed(
         self, timestamp: int, interval: int
-    ) -> Dict[str, bool]:
+    ) -> Dict[str, Dict[str, bool]]:
         """
         Capture snapshots from cameras using distributed timing to avoid rate limits.
 
@@ -610,7 +622,7 @@ class CameraManager:
             interval: Interval in seconds (for directory structure)
 
         Returns:
-            Dictionary mapping camera names to success status
+            Dictionary mapping camera names to a mapping of preset name -> success status
         """
         cameras = await self.get_cameras()
 
@@ -653,49 +665,87 @@ class CameraManager:
 
             async def capture_camera_no_distribution(
                 camera: Camera,
-            ) -> tuple[str, bool]:
+            ) -> tuple[str, Dict[str, bool]]:
                 async with semaphore:
-                    # Build output path using base timestamp
+                    # Run all presets serially for this camera
+                    results: Dict[str, bool] = {}
+                    presets = config.CAMERA_PRESETS.get(camera.name, {"Default": None})
+
                     date_obj = datetime.fromtimestamp(timestamp)
                     year = date_obj.strftime("%Y")
                     month = date_obj.strftime("%m")
                     day = date_obj.strftime("%d")
 
-                    output_dir = (
-                        config.IMAGE_OUTPUT_PATH
-                        / camera.safe_name
-                        / f"{interval}s"
-                        / year
-                        / month
-                        / day
+                    # Determine if any preset will move the camera
+                    moved_presets = any(
+                        (preset_number is not None and str(preset_number) != "-1")
+                        for preset_number in presets.values()
                     )
-                    output_path = output_dir / f"{camera.safe_name}_{timestamp}.jpg"
 
-                    success = await self.capture_snapshot_with_retry(
-                        camera, str(output_path), interval
-                    )
-                    return camera.name, success
+                    for preset_name, preset_number in presets.items():
+                        key = (camera.id, preset_name, timestamp)
+                        async with self._inflight_lock:
+                            if key in self._inflight_captures:
+                                logging.debug(f"Skipping duplicate capture for {camera.name} preset {preset_name} at {timestamp}")
+                                results[preset_name] = False
+                                continue
+                            self._inflight_captures.add(key)
+
+                        # Move to preset if defined
+                        if preset_number is not None:
+                            await self.goto_preset(camera, preset_number, preset_name)
+
+                        camera_dir_name = f"{camera.safe_name}-{preset_name}" if preset_name else camera.safe_name
+                        output_dir = (
+                            config.IMAGE_OUTPUT_PATH
+                            / camera_dir_name
+                            / f"{interval}s"
+                            / year
+                            / month
+                            / day
+                        )
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        output_path = output_dir / f"{camera.safe_name}_{timestamp}.jpg"
+
+                        try:
+                            success = await self.capture_snapshot_with_retry(
+                                camera, str(output_path), interval
+                            )
+                        finally:
+                            async with self._inflight_lock:
+                                try:
+                                    self._inflight_captures.remove(key)
+                                except KeyError:
+                                    pass
+
+                        results[preset_name] = success
+
+                    # Optionally return to Home after all presets
+                    if config.CAMERA_PTZ_RETURN_TO_HOME and moved_presets:
+                        await self.goto_preset(camera, -1, "Home")
+
+                    return camera.name, results
 
             # Execute all captures concurrently
-            tasks = [
-                capture_camera_no_distribution(camera) for camera in connected_cameras
-            ]
+            tasks = [capture_camera_no_distribution(camera) for camera in connected_cameras]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Process results
-            all_results = {}
+            # Process results into camera -> {preset: success}
+            all_results: Dict[str, Dict[str, bool]] = {}
             for result in results:
-                if isinstance(result, tuple):
-                    camera_name, success = result
-                    all_results[camera_name] = success
+                if isinstance(result, tuple) and len(result) == 2:
+                    camera_name, preset_results = result
+                    all_results[camera_name] = preset_results
                 else:
                     logging.error(f"Unexpected error in camera capture: {result}")
 
             # Log summary
-            successful = sum(1 for success in all_results.values() if success)
-            total = len(all_results)
+            total_presets = sum(len(presets) for presets in all_results.values())
+            successful_presets = sum(
+                1 for presets in all_results.values() for v in presets.values() if v
+            )
             logging.info(
-                f"[{interval}s] Captured {successful}/{total} connected cameras (no distribution)"
+                f"[{interval}s] Captured {successful_presets}/{total_presets} presets across {len(all_results)} cameras (no distribution)"
             )
 
             return all_results
@@ -723,34 +773,67 @@ class CameraManager:
             concurrent_limit = config.calculate_effective_concurrent_limit()
             semaphore = asyncio.Semaphore(min(len(group_cameras), concurrent_limit))
 
-            async def capture_camera_in_group(camera: Camera) -> tuple[str, bool]:
+            async def capture_camera_in_group(camera: Camera) -> tuple[str, Dict[str, bool]]:
                 async with semaphore:
-                    # Build output path using actual capture timestamp
+                    # Run all presets serially for this camera
+                    results: Dict[str, bool] = {}
+                    presets = config.CAMERA_PRESETS.get(camera.name, {"Default": None})
+
                     actual_capture_timestamp = timestamp + offset
                     date_obj = datetime.fromtimestamp(actual_capture_timestamp)
                     year = date_obj.strftime("%Y")
                     month = date_obj.strftime("%m")
                     day = date_obj.strftime("%d")
 
-                    output_dir = (
-                        config.IMAGE_OUTPUT_PATH
-                        / camera.safe_name
-                        / f"{interval}s"
-                        / year
-                        / month
-                        / day
-                    )
-                    # Use actual capture timestamp for accurate filenames
-                    actual_capture_timestamp = timestamp + offset
-                    output_path = (
-                        output_dir
-                        / f"{camera.safe_name}_{actual_capture_timestamp}.jpg"
+                    # Determine if any preset will move the camera
+                    moved_presets = any(
+                        (preset_number is not None and str(preset_number) != "-1")
+                        for preset_number in presets.values()
                     )
 
-                    success = await self.capture_snapshot_with_retry(
-                        camera, str(output_path), interval
-                    )
-                    return camera.name, success
+                    for preset_name, preset_number in presets.items():
+                        key = (camera.id, preset_name, actual_capture_timestamp)
+                        async with self._inflight_lock:
+                            if key in self._inflight_captures:
+                                logging.debug(f"Skipping duplicate capture for {camera.name} preset {preset_name} at {actual_capture_timestamp}")
+                                results[preset_name] = False
+                                continue
+                            self._inflight_captures.add(key)
+
+                        # Move to preset if defined
+                        if preset_number is not None:
+                            await self.goto_preset(camera, preset_number, preset_name)
+
+                        camera_dir_name = f"{camera.safe_name}-{preset_name}" if preset_name else camera.safe_name
+                        output_dir = (
+                            config.IMAGE_OUTPUT_PATH
+                            / camera_dir_name
+                            / f"{interval}s"
+                            / year
+                            / month
+                            / day
+                        )
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        output_path = output_dir / f"{camera.safe_name}_{actual_capture_timestamp}.jpg"
+
+                        try:
+                            success = await self.capture_snapshot_with_retry(
+                                camera, str(output_path), interval
+                            )
+                        finally:
+                            async with self._inflight_lock:
+                                try:
+                                    self._inflight_captures.remove(key)
+                                except KeyError:
+                                    pass
+
+                        results[preset_name] = success
+
+                    # Optionally return to Home after all presets
+                    if config.CAMERA_PTZ_RETURN_TO_HOME and moved_presets:
+                        await self.goto_preset(camera, -1, "Home")
+
+                    return camera.name, results
 
             # Execute captures for this group
             tasks = [capture_camera_in_group(camera) for camera in group_cameras]
@@ -758,9 +841,9 @@ class CameraManager:
 
             # Process group results
             for result in group_results:
-                if isinstance(result, tuple):
-                    camera_name, success = result
-                    all_results[camera_name] = success
+                if isinstance(result, tuple) and len(result) == 2:
+                    camera_name, preset_results = result
+                    all_results[camera_name] = preset_results
                 else:
                     logging.error(f"Unexpected error in camera capture: {result}")
 
@@ -787,7 +870,6 @@ class CameraManager:
             "Authorization": f"Bearer {config.UNIFI_PROTECT_API_KEY}",
             "Content-Type": "application/json",
         }
-
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -806,4 +888,48 @@ class CameraManager:
                         return False
         except Exception as e:
             logging.error(f"Error sending PTZ command for {camera.name}: {e}")
+            return False
+
+    async def goto_preset(self, camera: Camera, preset_number: str | int | None, preset_name: str | None = None) -> bool:
+        """Move camera to a named preset via the UniFi Protect "goto" endpoint.
+
+        Returns True on success (HTTP 200/204), False otherwise.
+        If `preset_number` is None, this is a no-op and returns False.
+        """
+        if preset_number is None:
+            return False
+
+        # Normalize preset number to string
+        preset_str = str(preset_number)
+
+        url = f"{config.UNIFI_PROTECT_BASE_URL}/cameras/{camera.id}/ptz/goto/{preset_str}"
+        headers = {
+            "X-API-Key": config.UNIFI_PROTECT_API_KEY,
+            "Accept": "application/json",
+            "User-Agent": "UniFi-Protect-Time-Lapse/2.0",
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    ssl=config.UNIFI_PROTECT_VERIFY_SSL,
+                    timeout=int(config.UNIFI_PROTECT_REQUEST_TIMEOUT),
+                ) as resp:
+                    if resp.status in (200, 204):
+                        logging.info(
+                            f"[PTZ] Moved {camera.name} to preset {preset_name} ({preset_str})"
+                        )
+                        # Allow camera time to reach the preset
+                        await asyncio.sleep(config.CAMERA_PTZ_PRESET_DELAY)
+                        return True
+                    else:
+                        logging.warning(
+                            f"[PTZ] PTZ move returned {resp.status} for {camera.name}"
+                        )
+                        return False
+
+        except Exception as e:
+            logging.warning(f"[PTZ] Error moving {camera.name} to preset {preset_name}: {e}")
             return False

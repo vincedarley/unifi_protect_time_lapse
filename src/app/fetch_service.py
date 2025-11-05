@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Mapping
 import time
 
 import config
@@ -172,9 +172,17 @@ class FetchService:
                 # Update statistics
                 self._update_stats(interval, results, capture_time)
 
-                # Log interval summary
-                successful = sum(1 for success in results.values() if success)
-                total = len(results)
+                # Compute interval summary (supports camera->bool and camera->{preset:bool})
+                successful = 0
+                total = 0
+                for v in results.values():
+                    if isinstance(v, dict):
+                        total += len(v)
+                        successful += sum(1 for s in v.values() if s)
+                    else:
+                        total += 1
+                        successful += 1 if v else 0
+
                 logging.debug(
                     f"{interval}s: Captured {successful}/{total} at {capture_time.strftime('%H:%M:%S')}{distribution_note}"
                 )
@@ -209,23 +217,33 @@ class FetchService:
             self._log_summary()
 
     def _update_stats(
-        self, interval: int, results: Dict[str, bool], capture_time: datetime
+        self, interval: int, results: Mapping[str, object], capture_time: datetime
     ):
         """Update statistics for an interval."""
         interval_stats = self.stats[interval]
 
         # Update overall stats
         interval_stats["last_capture_time"] = capture_time
-        interval_stats["total_captures"] += len(results)
+        # Results may be camera->bool or camera->{preset:bool}. Count presets as captures.
+        for camera_name, value in results.items():
+            if isinstance(value, dict):
+                presets_total = len(value)
+                presets_success = sum(1 for s in value.values() if s)
+                presets_failed = presets_total - presets_success
 
-        # Update per-camera stats
-        for camera_name, success in results.items():
-            if success:
-                interval_stats["successful_captures"] += 1
-                interval_stats["camera_stats"][camera_name]["success"] += 1
+                interval_stats["total_captures"] += presets_total
+                interval_stats["successful_captures"] += presets_success
+                interval_stats["failed_captures"] += presets_failed
+                interval_stats["camera_stats"][camera_name]["success"] += presets_success
+                interval_stats["camera_stats"][camera_name]["failure"] += presets_failed
             else:
-                interval_stats["failed_captures"] += 1
-                interval_stats["camera_stats"][camera_name]["failure"] += 1
+                interval_stats["total_captures"] += 1
+                if value:
+                    interval_stats["successful_captures"] += 1
+                    interval_stats["camera_stats"][camera_name]["success"] += 1
+                else:
+                    interval_stats["failed_captures"] += 1
+                    interval_stats["camera_stats"][camera_name]["failure"] += 1
 
     def _log_summary(self):
         """Log periodic summary of statistics."""
