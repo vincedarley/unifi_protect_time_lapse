@@ -310,6 +310,34 @@ class CameraManager:
 
         return self.cameras
 
+    async def _get_connected_cameras(self) -> List[Camera]:
+        """Return list of connected cameras to be used for capture.
+
+        This consolidates the common pattern of fetching cameras, filtering
+        out disconnected devices, and logging warnings so callers don't
+        duplicate the same logic.
+        """
+        cameras = await self.get_cameras()
+
+        if not cameras:
+            logging.warning("No cameras available for capture")
+            return []
+
+        connected_cameras = [camera for camera in cameras if camera.is_connected]
+        disconnected_cameras = [camera for camera in cameras if not camera.is_connected]
+
+        if disconnected_cameras:
+            disconnected_names = [cam.name for cam in disconnected_cameras]
+            logging.warning(
+                f"Skipping {len(disconnected_cameras)} disconnected cameras: {', '.join(disconnected_names)}"
+            )
+
+        if not connected_cameras:
+            logging.warning("No connected cameras available for capture")
+            return []
+
+        return connected_cameras
+
     async def capture_snapshot(
         self, camera: Camera, output_path: str, interval: int, retry_count: int = 0
     ) -> bool:
@@ -442,7 +470,7 @@ class CameraManager:
 
     async def capture_all_cameras(
         self, timestamp: int, interval: int
-    ) -> Dict[str, bool]:
+    ) -> Dict[str, Dict[str, bool]]:
         """
         Capture snapshots from all configured cameras concurrently.
 
@@ -453,126 +481,15 @@ class CameraManager:
         Returns:
             Dictionary mapping camera names to success status
         """
-        cameras = await self.get_cameras()
-
-        if not cameras:
-            logging.warning("No cameras available for capture")
-            return {}
-
-        # Filter out disconnected cameras
-        connected_cameras = [camera for camera in cameras if camera.is_connected]
-        disconnected_cameras = [camera for camera in cameras if not camera.is_connected]
-
-        # Log disconnected cameras
-        if disconnected_cameras:
-            disconnected_names = [cam.name for cam in disconnected_cameras]
-            logging.warning(
-                f"Skipping {len(disconnected_cameras)} disconnected cameras: {', '.join(disconnected_names)}"
-            )
-
+        connected_cameras = await self._get_connected_cameras()
         if not connected_cameras:
-            logging.warning("No connected cameras available for capture")
             return {}
 
         logging.debug(
             f"[{interval}s] Capturing from {len(connected_cameras)} connected cameras"
         )
 
-        # Create semaphore to limit concurrent requests - use new config function
-        concurrent_limit = config.calculate_effective_concurrent_limit()
-        semaphore = asyncio.Semaphore(concurrent_limit)
-
-        tasks = []
-
-        async def capture_with_semaphore(
-            camera: Camera,
-            interval: int,
-            timestamp: int,
-            preset_name: str | None = None,
-            preset_number: str | None = None,
-        ) -> tuple[str, str | None, bool]:
-            async with semaphore:
-                # Delegate per-preset capture to helper to avoid duplication
-                success = await self._capture_one_preset(
-                    camera, preset_name, preset_number, timestamp, interval
-                )
-
-                return camera.name, preset_name, success
-
-        # Execute captures: run different cameras in parallel, but run presets for the same camera serially
-        async def run_presets_serially(camera: Camera):
-            """Run all presets for a single camera one after another."""
-            camera_results = []
-            presets = config.CAMERA_PRESETS.get(camera.name, {"Default": None})
-
-            # Determine if any preset will actually move the camera (non-None and not Home)
-            moved_presets = any(
-                (preset_number is not None and str(preset_number) != "-1")
-                for preset_number in presets.values()
-            )
-
-            for preset_name in sorted(presets.keys()):
-                preset_number = presets[preset_name]
-                try:
-                    # Use the semaphore-backed single-preset capture
-                    result = await capture_with_semaphore(
-                        camera, interval, timestamp, preset_name, preset_number
-                    )
-                    camera_results.append(result)
-                except Exception as e:
-                    logging.error(
-                        f"Error capturing preset {preset_name} for {camera.name}: {e}"
-                    )
-
-
-            # After all presets for this camera have been executed serially,
-            # optionally return the camera to the Home preset (-1)
-            if config.CAMERA_PTZ_RETURN_TO_HOME and moved_presets:
-                returned = await self.goto_preset(camera, interval, -1, "Home")
-                if not returned:
-                    logging.warning(f"[PTZ] Failed to return {camera.name} to Home preset (-1)")
-
-            return camera_results
-
-        # Create one task per camera (presets inside will run serially)
-        for camera in connected_cameras:
-            tasks.append(asyncio.create_task(run_presets_serially(camera)))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process results (results is a list of lists-of-tuples or exceptions)
-        capture_results = {}
-        for item in results:
-            if isinstance(item, Exception):
-                logging.error(f"Unexpected error in camera capture: {item}")
-                continue
-
-            # item should be a list of tuples (camera_name, preset_name, success)
-            if isinstance(item, list):
-                for sub in item:
-                    if isinstance(sub, tuple):
-                        camera_name, preset_name, success = sub
-                        if camera_name not in capture_results:
-                            capture_results[camera_name] = {}
-                        capture_results[camera_name][preset_name] = success
-                    else:
-                        logging.error(f"Unexpected capture result item: {sub}")
-            else:
-                logging.error(f"Unexpected capture result type: {type(item)}")
-
-        # Log summary per camera
-        total_presets = 0
-        successful_presets = 0
-        for camera_name, presets in capture_results.items():
-            for preset_name, success in presets.items():
-                total_presets += 1
-                if success:
-                    successful_presets += 1
-                logging.info(f"[{interval}s] {camera_name} preset {preset_name}: {'Success' if success else 'Failed'}")
-
-        logging.info(f"[{interval}s] Captured {successful_presets}/{total_presets} presets across all connected cameras")
-
-        return capture_results
+        return await self._capture_from_set_of_cameras(connected_cameras, timestamp, interval)
 
     async def capture_cameras_distributed(
         self, timestamp: int, interval: int
@@ -587,25 +504,8 @@ class CameraManager:
         Returns:
             Dictionary mapping camera names to a mapping of preset name -> success status
         """
-        cameras = await self.get_cameras()
-
-        if not cameras:
-            logging.warning("No cameras available for capture")
-            return {}
-
-        # Filter out disconnected cameras
-        connected_cameras = [camera for camera in cameras if camera.is_connected]
-        disconnected_cameras = [camera for camera in cameras if not camera.is_connected]
-
-        # Log disconnected cameras
-        if disconnected_cameras:
-            disconnected_names = [cam.name for cam in disconnected_cameras]
-            logging.warning(
-                f"Skipping {len(disconnected_cameras)} disconnected cameras: {', '.join(disconnected_names)}"
-            )
-
+        connected_cameras = await self._get_connected_cameras()
         if not connected_cameras:
-            logging.warning("No connected cameras available for capture")
             return {}
 
         # Calculate optimal offset based on LOCKED settings
@@ -621,44 +521,7 @@ class CameraManager:
             logging.debug(
                 f"[{interval}s] No distribution needed, capturing all cameras immediately"
             )
-
-            # Create semaphore for all cameras
-            concurrent_limit = config.calculate_effective_concurrent_limit()
-            semaphore = asyncio.Semaphore(min(len(connected_cameras), concurrent_limit))
-
-            async def capture_camera_no_distribution(
-                camera: Camera,
-            ) -> tuple[str, Dict[str, bool]]:
-                async with semaphore:
-                    presets = config.CAMERA_PRESETS.get(camera.name, {"Default": None})
-                    results = await self._capture_presets_for_camera(
-                        camera, presets, timestamp, interval
-                    )
-                    return camera.name, results
-
-            # Execute all captures concurrently
-            tasks = [capture_camera_no_distribution(camera) for camera in connected_cameras]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Process results into camera -> {preset: success}
-            all_results: Dict[str, Dict[str, bool]] = {}
-            for result in results:
-                if isinstance(result, tuple) and len(result) == 2:
-                    camera_name, preset_results = result
-                    all_results[camera_name] = preset_results
-                else:
-                    logging.error(f"Unexpected error in camera capture: {result}")
-
-            # Log summary
-            total_presets = sum(len(presets) for presets in all_results.values())
-            successful_presets = sum(
-                1 for presets in all_results.values() for v in presets.values() if v
-            )
-            logging.info(
-                f"[{interval}s] Captured {successful_presets}/{total_presets} presets across {len(all_results)} cameras (no distribution)"
-            )
-
-            return all_results
+            return await self._capture_from_set_of_cameras(connected_cameras, timestamp, interval)
 
         # Group cameras by their offset (only if distribution is enabled)
         camera_groups: Dict[int, List[Camera]] = defaultdict(list)
@@ -679,42 +542,62 @@ class CameraManager:
                 f"[{interval}s] Capturing group at +{offset}s: {[cam.name for cam in group_cameras]}"
             )
 
-            # Create semaphore for this group - use new config function
-            concurrent_limit = config.calculate_effective_concurrent_limit()
-            semaphore = asyncio.Semaphore(min(len(group_cameras), concurrent_limit))
-
-            async def capture_camera_in_group(camera: Camera) -> tuple[str, Dict[str, bool]]:
-                async with semaphore:
-                    presets = config.CAMERA_PRESETS.get(camera.name, {"Default": None})
-                    actual_capture_timestamp = timestamp + offset
-                    results = await self._capture_presets_for_camera(
-                        camera, presets, actual_capture_timestamp, interval
-                    )
-                    return camera.name, results
-
-            # Execute captures for this group
-            tasks = [capture_camera_in_group(camera) for camera in group_cameras]
-            group_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Process group results
-            for result in group_results:
-                if isinstance(result, tuple) and len(result) == 2:
-                    camera_name, preset_results = result
-                    all_results[camera_name] = preset_results
-                else:
-                    logging.error(f"Unexpected error in camera capture: {result}")
+            group_results = await self._capture_from_set_of_cameras(group_cameras, timestamp + offset, interval)
+            for key, subdict in group_results.items():
+                all_results.setdefault(key, {}).update(subdict) 
 
             # Wait before next group (if there are more groups)
             remaining_groups = len([o for o in camera_groups.keys() if o > offset])
             if remaining_groups > 0:
                 await asyncio.sleep(optimal_offset)
 
-                # Log summary
+        # Log summary
         successful = sum(1 for success in all_results.values() if success)
         total = len(all_results)
         logging.info(
             f"[{interval}s] Captured {successful}/{total} connected cameras "
             f"(distributed across {len(camera_groups)} groups, {optimal_offset}s offset)"
+        )
+
+        return all_results
+
+    async def _capture_from_set_of_cameras(
+        self,
+        cameras: List[Camera], ts: int, ivl: int
+    ) -> Dict[str, Dict[str, bool]]:
+        # Create semaphore for all cameras
+        concurrent_limit = config.calculate_effective_concurrent_limit()
+        semaphore = asyncio.Semaphore(min(len(cameras), concurrent_limit))
+
+        async def capture_camera(
+            camera: Camera,
+        ) -> tuple[str, Dict[str, bool]]:
+            async with semaphore:
+                results = await self._capture_presets_for_camera(
+                    camera, ts, ivl
+                )
+                return camera.name, results
+
+        # Execute all captures concurrently
+        tasks = [capture_camera(camera) for camera in cameras]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results into camera -> {preset: success}
+        all_results: Dict[str, Dict[str, bool]] = {}
+        for result in results:
+            if isinstance(result, tuple) and len(result) == 2:
+                camera_name, preset_results = result
+                all_results[camera_name] = preset_results
+            else:
+                logging.error(f"Unexpected error in camera capture: {result}")
+
+        # Log summary
+        total_presets = sum(len(presets) for presets in all_results.values())
+        successful_presets = sum(
+            1 for presets in all_results.values() for v in presets.values() if v
+        )
+        logging.info(
+            f"[{ivl}s] Captured {successful_presets}/{total_presets} presets across {len(all_results)} cameras"
         )
 
         return all_results
@@ -760,14 +643,14 @@ class CameraManager:
                 camera, str(output_path), interval
             )
 
-            logging.info(f"[CAPTURE] {camera.name} preset {preset_name}: {'Success' if success else 'Failed'}")
+            logging.info(f"[CAPTURE] {camera.name} {interval}s preset {preset_name}: {'Success' if success else 'Failed'}")
             return success
         except Exception as e:
-            logging.error(f"[CAPTURE] {camera.name} preset {preset_name} failed: {e}")
+            logging.error(f"[CAPTURE] {camera.name} {interval}s preset {preset_name} failed: {e}")
             return False
 
     async def _capture_presets_for_camera(
-        self, camera: Camera, presets: Dict[str, Any], capture_timestamp: int, interval: int
+        self, camera: Camera, capture_timestamp: int, interval: int
     ) -> Dict[str, bool]:
         """Capture all presets for a camera serially.
 
@@ -775,6 +658,7 @@ class CameraManager:
         Handles determining whether presets move the camera and returning to Home if configured.
         """
         results: Dict[str, bool] = {}
+        presets: Dict[str, Any] = config.CAMERA_PRESETS.get(camera.name, {"Default": None})
 
         # Determine if any preset will move the camera
         moved_presets = any(
@@ -782,7 +666,7 @@ class CameraManager:
             for preset_number in presets.values()
         )
 
-        # Iterate presets in deterministic order
+        # Iterate presets in deterministic order, and do them serially...
         for preset_name in sorted(presets.keys()):
             preset_number = presets[preset_name]
             success = await self._capture_one_preset(
@@ -792,6 +676,8 @@ class CameraManager:
 
         # Optionally return to Home after all presets
         if config.CAMERA_PTZ_RETURN_TO_HOME and moved_presets:
+            # Allow time for any prior image captures to complete, then move to Home
+            await asyncio.sleep(config.CAMERA_PTZ_PRESET_DELAY)
             returned = await self.goto_preset(camera, interval, -1, "Home")
             if not returned:
                 logging.warning(f"[PTZ] Failed to return {camera.name} to Home preset (-1)")
