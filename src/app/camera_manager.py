@@ -627,7 +627,7 @@ class CameraManager:
             month = date_obj.strftime("%m")
             day = date_obj.strftime("%d")
 
-            camera_dir_name = f"{camera.safe_name}-{preset_name}" if preset_name else camera.safe_name
+            camera_dir_name = f"{camera.safe_name}-{preset_name}" if preset_name != "Default" else camera.safe_name
             output_dir = (
                 config.IMAGE_OUTPUT_PATH
                 / camera_dir_name
