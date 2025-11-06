@@ -148,10 +148,10 @@ class TimelapseService:
                 for interval in config.FETCH_INTERVALS:
                     details = f"{interval}s"
                     # Directory name includes preset suffix when present
-                    camera_dir_name = f"{camera.safe_name}-{preset_name}" if preset_name else camera.safe_name
+                    camera_dir_name = f"{camera.safe_name}-{preset_name}" if preset_name != "Default" else camera.safe_name
                     task = asyncio.create_task(
                         self._create_timelapse_for_camera_details(
-                            camera_dir_name, details, target_date
+                            camera.safe_name, camera_dir_name, details, target_date
                         )
                     )
                     tasks.append(task)
@@ -170,7 +170,7 @@ class TimelapseService:
             )
 
     async def _create_timelapse_for_camera_details(
-        self, camera_dir_name: str, details: str, target_date: datetime
+        self, camera_name: str, camera_dir_name: str, details: str, target_date: datetime
     ) -> bool | None:
         """Create a time-lapse video for a specific camera and details."""
 
@@ -203,7 +203,7 @@ class TimelapseService:
                 return None
 
             # Find image files
-            image_files = list(images_path.glob(f"{camera_dir_name}_*.jpg"))
+            image_files = list(images_path.glob(f"{camera_name}_*.jpg"))
             if not image_files:
                 logging.debug(
                     f"No images found for {camera_dir_name} {details} on {target_date.strftime('%Y-%m-%d')}"
@@ -230,7 +230,7 @@ class TimelapseService:
 
             # Create time-lapse video
             success = await self._create_video(
-                images_path, output_path, camera_dir_name, details
+                images_path, output_path, camera_name, camera_dir_name, details
             )
 
             if success and config.FFMPEG_DELETE_IMAGES_AFTER_SUCCESS:
@@ -247,7 +247,7 @@ class TimelapseService:
             return success
 
     async def _create_video(
-        self, images_path: Path, output_path: Path, camera_name: str, details: str
+        self, images_path: Path, output_path: Path, camera_name: str, camera_dir_name: str, details: str
     ) -> bool:
         """Create a video using FFmpeg."""
 
@@ -303,24 +303,24 @@ class TimelapseService:
                     formatted_size = self._format_file_size(file_size)
 
                     logging.info(
-                        f"✓ Created time-lapse for {camera_name} {details} in "
+                        f"✓ Created time-lapse for {camera_dir_name} {details} in "
                         f"{self._format_duration(duration_seconds)}, size: {formatted_size}"
                     )
                     return True
                 else:
                     logging.error(
-                        f"✗ Output file not created or empty for {camera_name} {details}"
+                        f"✗ Output file not created or empty for {camera_dir_name} {details}"
                     )
                     return False
             else:
                 error_msg = stderr.decode("utf-8") if stderr else "Unknown error"
                 logging.error(
-                    f"✗ FFmpeg failed for {camera_name} {details}: {error_msg[:200]}"
+                    f"✗ FFmpeg failed for {camera_dir_name} {details}: {error_msg[:200]}"
                 )
                 return False
 
         except Exception as e:
-            logging.error(f"✗ Error creating video for {camera_name} {details}: {e}")
+            logging.error(f"✗ Error creating video for {camera_dir_name} {details}: {e}")
             return False
 
     def _format_file_size(self, size_bytes: int) -> str:
