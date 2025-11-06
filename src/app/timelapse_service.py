@@ -170,7 +170,7 @@ class TimelapseService:
             )
 
     async def _create_timelapse_for_camera_details(
-        self, camera_name: str, details: str, target_date: datetime
+        self, camera_dir_name: str, details: str, target_date: datetime
     ) -> bool | None:
         """Create a time-lapse video for a specific camera and details."""
 
@@ -178,67 +178,70 @@ class TimelapseService:
             year = target_date.strftime("%Y")
             month = target_date.strftime("%m")
             day = target_date.strftime("%d")
+            logging.debug(
+                f"Creating timelapse for {camera_dir_name} {details} on {target_date.strftime('%Y-%m-%d')}"
+            )
 
             # Define paths
             images_path = (
                 config.IMAGE_OUTPUT_PATH
-                / camera_name
+                / camera_dir_name
                 / details
                 / year
                 / month
                 / day
             )
             videos_path = (
-                config.VIDEO_OUTPUT_PATH / year / month / camera_name / details
+                config.VIDEO_OUTPUT_PATH / year / month / camera_dir_name / details
             )
 
             # Check if images directory exists and has images
             if not images_path.exists():
                 logging.debug(
-                    f"No images directory for {camera_name} {details} on {target_date.strftime('%Y-%m-%d')}"
+                    f"No images directory for {camera_dir_name} {details} on {target_date.strftime('%Y-%m-%d')}"
                 )
                 return None
 
             # Find image files
-            image_files = list(images_path.glob(f"{camera_name}_*.jpg"))
+            image_files = list(images_path.glob(f"{camera_dir_name}_*.jpg"))
             if not image_files:
                 logging.debug(
-                    f"No images found for {camera_name} {details} on {target_date.strftime('%Y-%m-%d')}"
+                    f"No images found for {camera_dir_name} {details} on {target_date.strftime('%Y-%m-%d')}"
                 )
                 return None
 
             logging.info(
-                f"Creating time-lapse for {camera_name} {details}: {len(image_files)} images"
+                f"Creating time-lapse for {camera_dir_name} {details}: {len(image_files)} images"
             )
 
             # Create output directory
             videos_path.mkdir(parents=True, exist_ok=True)
 
             # Define output file
-            output_filename = f"{camera_name}_{year}{month}{day}_{details}.mp4"
+            output_filename = f"{camera_dir_name}_{year}{month}{day}_{details}.mp4"
             output_path = videos_path / output_filename
 
             # Check if file already exists and we shouldn't overwrite
             if output_path.exists() and not config.FFMPEG_OVERWRITE_FILE:
                 logging.info(
-                    f"Time-lapse already exists for {camera_name} {details}, skipping"
+                    f"Time-lapse already exists for {camera_dir_name} {details}, skipping"
                 )
                 return None
 
             # Create time-lapse video
             success = await self._create_video(
-                images_path, output_path, camera_name, details
+                images_path, output_path, camera_dir_name, details
             )
 
             if success and config.FFMPEG_DELETE_IMAGES_AFTER_SUCCESS:
                 try:
                     shutil.rmtree(images_path)
                     logging.info(
-                        f"Deleted images for {camera_name} {details} after successful video creation"
+                        f"Deleted images for {camera_dir_name} {details} after successful video creation"
                     )
                 except Exception as e:
                     logging.error(
-                        f"Failed to delete images for {camera_name} {details}: {e}"
+                        f"Failed to delete images for {camera_dir_name} {details}: {e}"
                     )
 
             return success
