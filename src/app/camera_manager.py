@@ -747,7 +747,7 @@ class CameraManager:
                         return True
                     else:
                         logging.warning(
-                            f"[PTZ] PTZ move returned {resp.status} for {camera.name}"
+                            f"[PTZ] PTZ move to preset {preset_name} ({preset_str}) returned {resp.status} for {camera.name}"
                         )
                         return False
 
