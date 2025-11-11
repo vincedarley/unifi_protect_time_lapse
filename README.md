@@ -193,6 +193,8 @@ CAMERA_PTZ_PRESET_DELAY: "2.0"     # Seconds to wait after moving to a preset
 
 When presets are configured, captured images are stored under the camera directory suffixed with the preset name, for example: `images/Front_Door_Cam-CloseUp/60s/...`.
 
+Note that preset numbers are unfortunately not obvious. The "Home" preset is always -1, and other presets take indices numbered 0,1,2, etc. However those slot numbers do not necessarily have to bear any relation to the preset numbers shown in the Protect UI.  When you create a preset in the Protect UI, the index number it is given is the lowest currently available. Whenever you delete presets their indices are freed. The preset number shown in the Protect UI is completely different: it is 1,2,3 etc, where "1" is the preset you created first (while this will often be preset index-0, if you have deleted presets this is not necessarily true), "2" is the preset you created second, etc. If you never delete presets then things are easy: subtract 1 from the number shown in the Protect UI to get the preset index number needed by this configuration.
+
 ### Fetch Settings (Rate-Limit Aware)
 
 | Variable | Description | Default | Example |

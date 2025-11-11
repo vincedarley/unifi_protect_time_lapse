@@ -619,7 +619,9 @@ class CameraManager:
         try:
             # Move to preset if defined
             if preset_number is not None:
-                await self.goto_preset(camera, interval, preset_number, preset_name)
+                if not await self.goto_preset(camera, interval, preset_number, preset_name):
+                    logging.error(f"[CAPTURE] {camera.name} {interval}s preset {preset_name} not attempted, since preset move failed.")
+                    return False
 
             # Build output path and capture
             date_obj = datetime.fromtimestamp(capture_timestamp)
