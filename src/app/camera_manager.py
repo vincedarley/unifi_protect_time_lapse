@@ -686,34 +686,6 @@ class CameraManager:
 
         return results
 
-    async def set_ptz(self, camera: Camera, ptz: dict) -> bool:
-        """Send PTZ command to UniFi Protect for the given camera."""
-        url = f"{config.UNIFI_PROTECT_BASE_URL}/api/cameras/{camera.id}/ptz"
-
-        headers = {
-            "Authorization": f"Bearer {config.UNIFI_PROTECT_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    headers=headers,
-                    json=ptz,
-                    ssl=(config.UNIFI_PROTECT_VERIFY_SSL),
-                    timeout=int(config.UNIFI_PROTECT_REQUEST_TIMEOUT),
-                ) as response:
-                    if response.status == 200:
-                        return True
-                    else:
-                        logging.warning(
-                            f"PTZ request failed for {camera.name}: {response.status}"
-                        )
-                        return False
-        except Exception as e:
-            logging.error(f"Error sending PTZ command for {camera.name}: {e}")
-            return False
-
     async def goto_preset(self, camera: Camera, interval: int, preset_number: str | int | None, preset_name: str | None = None) -> bool:
         """Move camera to a named preset via the UniFi Protect "goto" endpoint.
         Returns True on success (HTTP 200/204), False otherwise.
